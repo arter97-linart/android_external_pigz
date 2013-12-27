@@ -1,6 +1,6 @@
 /* pigz.c -- parallel implementation of gzip
  * Copyright (C) 2007, 2008, 2009, 2010, 2011, 2012, 2013 Mark Adler
- * Version 2.3  3 Mar 2013  Mark Adler
+ * Version 2.3.1  9 Oct 2013  Mark Adler
  */
 
 /*
@@ -149,14 +149,22 @@
                        Print name of executable in error messages
                        Show help properly when the name is unpigz or gunzip
                        Fix permissions security problem before output is closed
-   2.3     3 Mar 2013  Don't complain about missing suffix when not writing output file
-                       Put all global variables in one global structure for readability
-                       Do not decompress concatenated zlib streams -- only gzip streams
+   2.3     3 Mar 2013  Don't complain about missing suffix on stdout
+                       Put all global variables in a structure for readability
+                       Do not decompress concatenated zlib streams (just gzip)
                        Add option for compression level 11 to use zopfli
                        Fix handling of junk after compressed data
+   2.3.1   9 Oct 2013  Fix builds of pigzt and pigzn to include zopfli
+                       Add -lm, needed to link log function on some systems
+                       Respect LDFLAGS in Makefile, use CFLAGS consistently
+                       Add memory allocation tracking
+                       Fix casting error in uncompressed length calculation
+                       Update zopfli to Mar 10, 2013 Google state
+                       Support zopfli in single thread case
+                       Add -F, -I, -M, and -O options for zopfli tuning
  */
 
-#define VERSION "pigz 2.3\n"
+#define VERSION "pigz 2.3.1\n"
 
 /* To-do:
     - make source portable for Windows, VMS, etc. (see gzip source code)
@@ -314,9 +322,24 @@
                         /* O_WRONLY */
 #include <dirent.h>     /* opendir(), readdir(), closedir(), DIR, */
                         /* struct dirent */
-#include <limits.h>     /* PATH_MAX, UINT_MAX */
+#include <limits.h>     /* PATH_MAX, UINT_MAX, INT_MAX */
 #if __STDC_VERSION__-0 >= 199901L || __GNUC__-0 >= 3
 #  include <inttypes.h> /* intmax_t */
+#endif
+
+#ifdef DEBUG
+#  if defined(__APPLE__)
+#    include <malloc/malloc.h>
+#    define MALLOC_SIZE(p) malloc_size(p)
+#  elif defined (__linux)
+#    include <malloc.h>
+#    define MALLOC_SIZE(p) malloc_usable_size(p)
+#  elif defined (_WIN32) || defined(_WIN64)
+#    include <malloc.h>
+#    define MALLOC_SIZE(p) _msize(p)
+#  else
+#    define MALLOC_SIZE(p) (0)
+#  endif
 #endif
 
 #ifdef __hpux
@@ -341,7 +364,8 @@
 #endif
 
 #ifndef WITHOUT_ZOPFLI
-#include "zopfli/deflate.h"     /* DeflatePart(), Options */
+#include "zopfli/deflate.h"     /* ZopfliDeflatePart(), ZopfliInitOptions(),
+                                   ZopfliOptions */
 #endif
 
 /* for local functions and globals */
@@ -359,7 +383,7 @@
 #define RELEASE(ptr) \
     do { \
         if ((ptr) != NULL) { \
-            free(ptr); \
+            FREE(ptr); \
             ptr = NULL; \
         } \
     } while (0)
@@ -451,6 +475,7 @@ local struct {
     int first;              /* true if we need to print listing header */
     int decode;             /* 0 to compress, 1 to decompress, 2 to test */
     int level;              /* compression level */
+    ZopfliOptions zopts;    /* zopfli compression options */
     int rsync;              /* true for rsync blocking */
     int procs;              /* maximum number of compression threads (>= 1) */
     int setdict;            /* true to initialize dictionary in each thread */
@@ -513,6 +538,105 @@ local int bail(char *why, char *what)
 
 #ifdef DEBUG
 
+/* memory tracking */
+
+local struct mem_track_s {
+    size_t num;         /* current number of allocations */
+    size_t size;        /* total size of current allocations */
+    size_t max;         /* maximum size of allocations */
+#ifndef NOTHREAD
+    lock *lock;         /* lock for access across threads */
+#endif
+} mem_track;
+
+#ifndef NOTHREAD
+#  define mem_track_grab(m) possess((m)->lock)
+#  define mem_track_drop(m) release((m)->lock)
+#else
+#  define mem_track_grab(m)
+#  define mem_track_drop(m)
+#endif
+
+local void *malloc_track(struct mem_track_s *mem, size_t size)
+{
+    void *ptr;
+
+    ptr = malloc(size);
+    if (ptr != NULL) {
+        size = MALLOC_SIZE(ptr);
+        mem_track_grab(mem);
+        mem->num++;
+        mem->size += size;
+        if (mem->size > mem->max)
+            mem->max = mem->size;
+        mem_track_drop(mem);
+    }
+    return ptr;
+}
+
+local void *realloc_track(struct mem_track_s *mem, void *ptr, size_t size)
+{
+    size_t was;
+
+    if (ptr == NULL)
+        return malloc_track(mem, size);
+    was = MALLOC_SIZE(ptr);
+    ptr = realloc(ptr, size);
+    if (ptr != NULL) {
+        size = MALLOC_SIZE(ptr);
+        mem_track_grab(mem);
+        mem->size -= was;
+        mem->size += size;
+        if (mem->size > mem->max)
+            mem->max = mem->size;
+        mem_track_drop(mem);
+    }
+    return ptr;
+}
+
+local void free_track(struct mem_track_s *mem, void *ptr)
+{
+    size_t size;
+
+    if (ptr != NULL) {
+        size = MALLOC_SIZE(ptr);
+        mem_track_grab(mem);
+        mem->num--;
+        mem->size -= size;
+        mem_track_drop(mem);
+        free(ptr);
+    }
+}
+
+#ifndef NOTHREAD
+local void *yarn_malloc(size_t size)
+{
+    return malloc_track(&mem_track, size);
+}
+
+local void yarn_free(void *ptr)
+{
+    return free_track(&mem_track, ptr);
+}
+#endif
+
+local voidpf zlib_alloc(voidpf opaque, uInt items, uInt size)
+{
+    return malloc_track(opaque, items * (size_t)size);
+}
+
+local void zlib_free(voidpf opaque, voidpf address)
+{
+    free_track(opaque, address);
+}
+
+#define MALLOC(s) malloc_track(&mem_track, s)
+#define REALLOC(p, s) realloc_track(&mem_track, p, s)
+#define FREE(p) free_track(&mem_track, p)
+#define OPAQUE (&mem_track)
+#define ZALLOC zlib_alloc
+#define ZFREE zlib_free
+
 /* starting time of day for tracing */
 local struct timeval start;
 
@@ -533,7 +657,12 @@ local struct log {
 local void log_init(void)
 {
     if (log_tail == NULL) {
+        mem_track.num = 0;
+        mem_track.size = 0;
+        mem_track.max = 0;
 #ifndef NOTHREAD
+        mem_track.lock = new_lock(0);
+        yarn_mem(yarn_malloc, yarn_free);
         log_lock = new_lock(0);
 #endif
         log_head = NULL;
@@ -550,16 +679,16 @@ local void log_add(char *fmt, ...)
     char msg[MAXMSG];
 
     gettimeofday(&now, NULL);
-    me = malloc(sizeof(struct log));
+    me = MALLOC(sizeof(struct log));
     if (me == NULL)
         bail("not enough memory", "");
     me->when = now;
     va_start(ap, fmt);
     vsnprintf(msg, MAXMSG, fmt, ap);
     va_end(ap);
-    me->msg = malloc(strlen(msg) + 1);
+    me->msg = MALLOC(strlen(msg) + 1);
     if (me->msg == NULL) {
-        free(me);
+        FREE(me);
         bail("not enough memory", "");
     }
     strcpy(me->msg, msg);
@@ -608,8 +737,8 @@ local int log_show(void)
     fprintf(stderr, "trace %ld.%06ld %s\n",
             (long)diff.tv_sec, (long)diff.tv_usec, me->msg);
     fflush(stderr);
-    free(me->msg);
-    free(me);
+    FREE(me->msg);
+    FREE(me);
     return 1;
 }
 
@@ -624,13 +753,15 @@ local void log_free(void)
 #endif
         while ((me = log_head) != NULL) {
             log_head = me->next;
-            free(me->msg);
-            free(me);
+            FREE(me->msg);
+            FREE(me);
         }
 #ifndef NOTHREAD
         twist(log_lock, TO, 0);
         free_lock(log_lock);
         log_lock = NULL;
+        yarn_mem(malloc, free);
+        free_lock(mem_track.lock);
 #endif
         log_tail = NULL;
     }
@@ -644,6 +775,11 @@ local void log_dump(void)
     while (log_show())
         ;
     log_free();
+    if (mem_track.num || mem_track.size)
+        complain("memory leak: %lu allocs of %lu bytes total",
+                 mem_track.num, mem_track.size);
+    if (mem_track.max)
+        fprintf(stderr, "%lu bytes of memory used\n", mem_track.max);
 }
 
 /* debugging macro */
@@ -655,6 +791,13 @@ local void log_dump(void)
     } while (0)
 
 #else /* !DEBUG */
+
+#define MALLOC malloc
+#define REALLOC realloc
+#define FREE free
+#define OPAQUE Z_NULL
+#define ZALLOC Z_NULL
+#define ZFREE Z_NULL
 
 #define log_dump()
 #define Trace(x)
@@ -1046,11 +1189,11 @@ local struct space *get_space(struct pool *pool)
         pool->limit--;
     pool->made++;
     release(pool->have);
-    space = malloc(sizeof(struct space));
+    space = MALLOC(sizeof(struct space));
     if (space == NULL)
         bail("not enough memory", "");
     space->use = new_lock(1);           /* initially one user */
-    space->buf = malloc(pool->size);
+    space->buf = MALLOC(pool->size);
     if (space->buf == NULL)
         bail("not enough memory", "");
     space->size = pool->size;
@@ -1092,7 +1235,7 @@ local void grow_space(struct space *space)
         bail("not enough memory", "");
 
     /* reallocate the buffer */
-    space->buf = realloc(space->buf, more);
+    space->buf = REALLOC(space->buf, more);
     if (space->buf == NULL)
         bail("not enough memory", "");
     space->size = more;
@@ -1136,9 +1279,9 @@ local int free_pool(struct pool *pool)
     count = 0;
     while ((space = pool->head) != NULL) {
         pool->head = space->next;
-        free(space->buf);
+        FREE(space->buf);
         free_lock(space->use);
-        free(space);
+        FREE(space);
         count++;
     }
     assert(count == pool->made);
@@ -1284,17 +1427,14 @@ local void compress_thread(void *dummy)
     int bits;                       /* deflate pending bits */
 #endif
     struct space *temp;             /* temporary space for zopfli input */
-#ifndef WITHOUT_ZOPFLI
-    Options opts;                   /* zopfli options */
-#endif
     z_stream strm;                  /* deflate stream */
 
     (void)dummy;
 
     /* initialize the deflate stream for this thread */
-    strm.zfree = Z_NULL;
-    strm.zalloc = Z_NULL;
-    strm.opaque = Z_NULL;
+    strm.zfree = ZFREE;
+    strm.zalloc = ZALLOC;
+    strm.opaque = OPAQUE;
     if (deflateInit2(&strm, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK)
         bail("not enough memory", "");
 
@@ -1322,20 +1462,13 @@ local void compress_thread(void *dummy)
         }
 #ifndef WITHOUT_ZOPFLI
         else {
-            /* default zopfli options as set by InitOptions():
-                 verbose = 0
-                 numiterations = 15
-                 blocksplitting = 1
-                 blocksplittinglast = 0
-                 blocksplittingmax = 15
-             */
-            InitOptions(&opts);
             temp = get_space(&out_pool);
             temp->len = 0;
         }
 #endif
         /* set dictionary if provided, release that input or dictionary buffer
-           (not NULL if dict is true and if this is not the first work unit) */
+           (not NULL if g.setdict is true and if this is not the first work
+           unit) */
         if (job->out != NULL) {
             len = job->out->len;
             left = len < DICT ? len : DICT;
@@ -1431,9 +1564,9 @@ local void compress_thread(void *dummy)
                 out = NULL;
                 outsize = 0;
                 bits = 0;
-                DeflatePart(&opts, 2, !(left || job->more),
-                            temp->buf, temp->len, temp->len + len,
-                            &bits, &out, &outsize);
+                ZopfliDeflatePart(&g.zopts, 2, !(left || job->more),
+                                  temp->buf, temp->len, temp->len + len,
+                                  &bits, &out, &outsize);
                 assert(job->out->len + outsize + 5 <= job->out->size);
                 memcpy(job->out->buf + job->out->len, out, outsize);
                 free(out);
@@ -1563,7 +1696,7 @@ local void write_thread(void *dummy)
 
         /* free the job */
         free_lock(job->calc);
-        free(job);
+        FREE(job);
 
         /* get the next buffer in sequence */
         seq++;
@@ -1634,7 +1767,7 @@ local void parallel_compress(void)
     writeth = launch(write_thread, NULL);
 
     /* read from input and start compress threads (write thread will pick up
-     the output of the compress threads) */
+       the output of the compress threads) */
     seq = 0;
     next = get_space(&in_pool);
     next->len = readn(g.ind, next->buf, next->size);
@@ -1645,7 +1778,7 @@ local void parallel_compress(void)
     left = 0;
     do {
         /* create a new job */
-        job = malloc(sizeof(struct job));
+        job = MALLOC(sizeof(struct job));
         if (job == NULL)
             bail("not enough memory", "");
         job->calc = new_lock(0);
@@ -1809,14 +1942,13 @@ local void parallel_compress(void)
    output, and deflate */
 local void single_compress(int reset)
 {
-    size_t got;                     /* amount read */
-    size_t more;                    /* amount of next read (0 if eof) */
-    size_t start;                   /* start of next read */
+    size_t got;                     /* amount of data in in[] */
+    size_t more;                    /* amount of data in next[] (0 if eof) */
+    size_t start;                   /* start of data in next[] */
     size_t have;                    /* bytes in current block for -i */
+    size_t hist;                    /* offset of permitted history */
+    int fresh;                      /* if true, reset compression history */
     unsigned hash;                  /* hash for rsyncable */
-#if ZLIB_VERNUM >= 0x1260
-    int bits;                       /* deflate pending bits */
-#endif
     unsigned char *scan;            /* pointer for hash computation */
     size_t left;                    /* bytes left to compress after hash hit */
     unsigned long head;             /* header length */
@@ -1831,10 +1963,10 @@ local void single_compress(int reset)
     if (reset) {
         if (strm != NULL) {
             (void)deflateEnd(strm);
-            free(strm);
-            free(out);
-            free(next);
-            free(in);
+            FREE(strm);
+            FREE(out);
+            FREE(next);
+            FREE(in);
             strm = NULL;
         }
         return;
@@ -1843,14 +1975,14 @@ local void single_compress(int reset)
     /* initialize the deflate structure if this is the first time */
     if (strm == NULL) {
         out_size = g.block > MAXP2 ? MAXP2 : (unsigned)g.block;
-        if ((in = malloc(g.block)) == NULL ||
-            (next = malloc(g.block)) == NULL ||
-            (out = malloc(out_size)) == NULL ||
-            (strm = malloc(sizeof(z_stream))) == NULL)
+        if ((in = MALLOC(g.block + DICT)) == NULL ||
+            (next = MALLOC(g.block + DICT)) == NULL ||
+            (out = MALLOC(out_size)) == NULL ||
+            (strm = MALLOC(sizeof(z_stream))) == NULL)
             bail("not enough memory", "");
-        strm->zfree = Z_NULL;
-        strm->zalloc = Z_NULL;
-        strm->opaque = Z_NULL;
+        strm->zfree = ZFREE;
+        strm->zalloc = ZALLOC;
+        strm->opaque = OPAQUE;
         if (deflateInit2(strm, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) !=
                          Z_OK)
             bail("not enough memory", "");
@@ -1860,16 +1992,17 @@ local void single_compress(int reset)
     head = put_header();
 
     /* set compression level in case it changed */
-    if (g.level > 9)
-        bail("compression level 11 not yet implemented for one thread", "");
-    (void)deflateReset(strm);
-    (void)deflateParams(strm, g.level, Z_DEFAULT_STRATEGY);
+    if (g.level <= 9) {
+        (void)deflateReset(strm);
+        (void)deflateParams(strm, g.level, Z_DEFAULT_STRATEGY);
+    }
 
     /* do raw deflate and calculate check value */
     got = 0;
     more = readn(g.ind, next, g.block);
-    ulen = (unsigned)more;
+    ulen = (unsigned long)more;
     start = 0;
+    hist = 0;
     clen = 0;
     have = 0;
     check = CHECK(0L, Z_NULL, 0);
@@ -1880,9 +2013,18 @@ local void single_compress(int reset)
             scan = in;  in = next;  next = scan;
             strm->next_in = in + start;
             got = more;
-            more = readn(g.ind, next, g.block);
+            if (g.level > 9) {
+                left = start + more - hist;
+                if (left > DICT)
+                    left = DICT;
+                memcpy(next, in + ((start + more) - left), left);
+                start = left;
+                hist = 0;
+            }
+            else
+                start = 0;
+            more = readn(g.ind, next + start, g.block);
             ulen += (unsigned long)more;
-            start = 0;
         }
 
         /* if rsyncable, compute hash until a hit or the end of the block */
@@ -1899,9 +2041,15 @@ local void single_compress(int reset)
 
                     /* fill in[] with what's left there and as much as possible
                        from next[] -- set up to continue hash hit search */
-                    memmove(in, strm->next_in, got);
-                    strm->next_in = in;
-                    scan = in + got;
+                    if (g.level > 9) {
+                        left = (strm->next_in - in) - hist;
+                        if (left > DICT)
+                            left = DICT;
+                    }
+                    memmove(in, strm->next_in - left, left + got);
+                    hist = 0;
+                    strm->next_in = in + left;
+                    scan = in + left + got;
                     left = more > g.block - got ? g.block - got : more;
                     memcpy(scan, next + start, left);
                     got += left;
@@ -1922,46 +2070,103 @@ local void single_compress(int reset)
         }
 
         /* clear history for --independent option */
+        fresh = 0;
         if (!g.setdict) {
             have += got;
             if (have > g.block) {
-                (void)deflateReset(strm);
+                fresh = 1;
                 have = got;
             }
         }
 
-        /* compress MAXP2-size chunks in case unsigned type is small */
-        while (got > MAXP2) {
-            strm->avail_in = MAXP2;
-            check = CHECK(check, strm->next_in, strm->avail_in);
-            DEFLATE_WRITE(Z_NO_FLUSH);
-            got -= MAXP2;
-        }
+        if (g.level <= 9) {
+            /* clear history if requested */
+            if (fresh)
+                (void)deflateReset(strm);
 
-        /* compress the remainder, emit a block -- finish if end of input */
-        strm->avail_in = (unsigned)got;
-        got = left;
-        check = CHECK(check, strm->next_in, strm->avail_in);
-        if (more || got) {
-#if ZLIB_VERNUM >= 0x1260
-            DEFLATE_WRITE(Z_BLOCK);
-            (void)deflatePending(strm, Z_NULL, &bits);
-            if (bits & 1)
-                DEFLATE_WRITE(Z_SYNC_FLUSH);
-            else if (bits & 7) {
-                do {
-                    bits = deflatePrime(strm, 10, 2);
-                    assert(bits == Z_OK);
-                    (void)deflatePending(strm, Z_NULL, &bits);
-                } while (bits & 7);
+            /* compress MAXP2-size chunks in case unsigned type is small */
+            while (got > MAXP2) {
+                strm->avail_in = MAXP2;
+                check = CHECK(check, strm->next_in, strm->avail_in);
                 DEFLATE_WRITE(Z_NO_FLUSH);
+                got -= MAXP2;
             }
+
+            /* compress the remainder, emit a block, finish if end of input */
+            strm->avail_in = (unsigned)got;
+            got = left;
+            check = CHECK(check, strm->next_in, strm->avail_in);
+            if (more || got) {
+#if ZLIB_VERNUM >= 0x1260
+                int bits;
+
+                DEFLATE_WRITE(Z_BLOCK);
+                (void)deflatePending(strm, Z_NULL, &bits);
+                if (bits & 1)
+                    DEFLATE_WRITE(Z_SYNC_FLUSH);
+                else if (bits & 7) {
+                    do {
+                        bits = deflatePrime(strm, 10, 2);
+                        assert(bits == Z_OK);
+                        (void)deflatePending(strm, Z_NULL, &bits);
+                    } while (bits & 7);
+                    DEFLATE_WRITE(Z_NO_FLUSH);
+                }
 #else
-            DEFLATE_WRITE(Z_SYNC_FLUSH);
+                DEFLATE_WRITE(Z_SYNC_FLUSH);
 #endif
+            }
+            else
+                DEFLATE_WRITE(Z_FINISH);
         }
-        else
-            DEFLATE_WRITE(Z_FINISH);
+        else {
+            /* compress got bytes using zopfli, bring to byte boundary */
+            unsigned char bits, *out;
+            size_t outsize, off;
+
+            /* discard history if requested */
+            off = strm->next_in - in;
+            if (fresh)
+                hist = off;
+
+            out = NULL;
+            outsize = 0;
+            bits = 0;
+            ZopfliDeflatePart(&g.zopts, 2, !(more || left),
+                              in + hist, off - hist, (off - hist) + got,
+                              &bits, &out, &outsize);
+            bits &= 7;
+            if ((more || left) && bits) {
+                if (bits & 1) {
+                    writen(g.outd, out, outsize);
+                    if (bits == 7)
+                        writen(g.outd, (unsigned char *)"\0", 1);
+                    writen(g.outd, (unsigned char *)"\0\0\xff\xff", 4);
+                }
+                else {
+                    assert(outsize > 0);
+                    writen(g.outd, out, outsize - 1);
+                    do {
+                        out[outsize - 1] += 2 << bits;
+                        writen(g.outd, out + outsize - 1, 1);
+                        out[outsize - 1] = 0;
+                        bits += 2;
+                    } while (bits < 8);
+                    writen(g.outd, out + outsize - 1, 1);
+                }
+            }
+            else
+                writen(g.outd, out, outsize);
+            free(out);
+            while (got > MAXP2) {
+                check = CHECK(check, strm->next_in, MAXP2);
+                strm->next_in += MAXP2;
+                got -= MAXP2;
+            }
+            check = CHECK(check, strm->next_in, (unsigned)got);
+            strm->next_in += got;
+            got = left;
+        }
 
         /* do until no more input */
     } while (more || got);
@@ -2240,7 +2445,7 @@ local int get_header(int save)
         fname = GET2();
         extra = GET2();
         if (save) {
-            char *next = g.hname = malloc(fname + 1);
+            char *next = g.hname = MALLOC(fname + 1);
             if (g.hname == NULL)
                 bail("not enough memory", "");
             while (fname > g.in_left) {
@@ -2297,7 +2502,7 @@ local int get_header(int save)
     if ((flags & 8) && save) {
         unsigned char *end;
         size_t copy, have, size = 128;
-        g.hname = malloc(size);
+        g.hname = MALLOC(size);
         if (g.hname == NULL)
             bail("not enough memory", "");
         have = 0;
@@ -2309,7 +2514,7 @@ local int get_header(int save)
             if (have + copy > size) {
                 while (have + copy > (size <<= 1))
                     ;
-                g.hname = realloc(g.hname, size);
+                g.hname = REALLOC(g.hname, size);
                 if (g.hname == NULL)
                     bail("not enough memory", "");
             }
@@ -2666,8 +2871,6 @@ local int outb(void *desc, unsigned char *buf, unsigned len)
 #ifndef NOTHREAD
     static thread *wr, *ch;
 
-    (void)desc;
-
     if (g.procs > 1) {
         /* if first time, initialize state and launch threads */
         if (outb_write_more == NULL) {
@@ -2707,6 +2910,8 @@ local int outb(void *desc, unsigned char *buf, unsigned len)
     }
 #endif
 
+    (void)desc;
+
     /* if just one process or no threads, then do it without threads */
     if (len) {
         if (g.decode == 1)
@@ -2736,9 +2941,9 @@ local void infchk(void)
         g.in_tot = g.in_left;       /* track compressed data length */
         g.out_tot = 0;
         g.out_check = CHECK(0L, Z_NULL, 0);
-        strm.zalloc = Z_NULL;
-        strm.zfree = Z_NULL;
-        strm.opaque = Z_NULL;
+        strm.zalloc = ZALLOC;
+        strm.zfree = ZFREE;
+        strm.opaque = OPAQUE;
         ret = inflateBackInit(&strm, 15, out_buf);
         if (ret != Z_OK)
             bail("not enough memory", "");
@@ -3169,7 +3374,7 @@ local void process(char *path)
             if (here == NULL)
                 return;
             hold = 512;
-            roll = malloc(hold);
+            roll = MALLOC(hold);
             if (roll == NULL)
                 bail("not enough memory", "");
             *roll = 0;
@@ -3184,9 +3389,9 @@ local void process(char *path)
                     do {                    /* make roll bigger */
                         hold <<= 1;
                     } while (item + len + 1 > roll + hold);
-                    bigger = realloc(roll, hold);
+                    bigger = REALLOC(roll, hold);
                     if (bigger == NULL) {
-                        free(roll);
+                        FREE(roll);
                         bail("not enough memory", "");
                     }
                     item = bigger + (item - roll);
@@ -3218,7 +3423,7 @@ local void process(char *path)
             *cut = 0;
 
             /* release list of entries */
-            free(roll);
+            FREE(roll);
             return;
         }
 
@@ -3300,7 +3505,7 @@ local void process(char *path)
     /* create output file out, descriptor outd */
     if (path == NULL || g.pipeout) {
         /* write to stdout */
-        g.outf = malloc(strlen("<stdout>") + 1);
+        g.outf = MALLOC(strlen("<stdout>") + 1);
         if (g.outf == NULL)
             bail("not enough memory", "");
         strcpy(g.outf, "<stdout>");
@@ -3323,7 +3528,7 @@ local void process(char *path)
         repl = g.decode && strcmp(to + len, ".tgz") ? "" : ".tar";
 
         /* create output file and open to write */
-        g.outf = malloc(len + (g.decode ? strlen(repl) : strlen(g.sufx)) + 1);
+        g.outf = MALLOC(len + (g.decode ? strlen(repl) : strlen(g.sufx)) + 1);
         if (g.outf == NULL)
             bail("not enough memory", "");
         memcpy(g.outf, to, len);
@@ -3422,14 +3627,18 @@ local char *helptext[] = {
 "  -c, --stdout         Write all processed output to stdout (won't delete)",
 "  -d, --decompress     Decompress the compressed input",
 "  -f, --force          Force overwrite, compress .gz, links, and to terminal",
+"  -F  --first          Do iterations first, before block split for -11",
 "  -h, --help           Display a help screen and quit",
 "  -i, --independent    Compress blocks independently for damage recovery",
+"  -I, --iterations n   Number of iterations for -11 optimization",
 "  -k, --keep           Do not delete original file after processing",
 "  -K, --zip            Compress to PKWare zip (.zip) single entry format",
 "  -l, --list           List the contents of the compressed input",
 "  -L, --license        Display the pigz license and quit",
+"  -M, --maxsplits n    Maximum number of split blocks for -11",
 "  -n, --no-name        Do not store or restore file name in/from header",
 "  -N, --name           Store/restore file name and mod time in/from header",
+"  -O  --oneblock       Do not split into smaller blocks for -11",
 #ifndef NOTHREAD
 "  -p, --processes n    Allow up to n compression threads (default is the",
 "                       number of online processors, or 8 if unknown)",
@@ -3491,6 +3700,14 @@ local int nprocs(int n)
 local void defaults(void)
 {
     g.level = Z_DEFAULT_COMPRESSION;
+    /* default zopfli options as set by ZopfliInitOptions():
+        verbose = 0
+        numiterations = 15
+        blocksplitting = 1
+        blocksplittinglast = 0
+        blocksplittingmax = 15
+     */
+    ZopfliInitOptions(&g.zopts);
 #ifdef NOTHREAD
     g.procs = 1;
 #else
@@ -3514,9 +3731,10 @@ local void defaults(void)
 /* long options conversion to short options */
 local char *longopts[][2] = {
     {"LZW", "Z"}, {"ascii", "a"}, {"best", "9"}, {"bits", "Z"},
-    {"blocksize", "b"}, {"decompress", "d"}, {"fast", "1"}, {"force", "f"},
-    {"help", "h"}, {"independent", "i"}, {"keep", "k"}, {"license", "L"},
-    {"list", "l"}, {"name", "N"}, {"no-name", "n"}, {"no-time", "T"},
+    {"blocksize", "b"}, {"decompress", "d"}, {"fast", "1"}, {"first", "F"},
+    {"force", "f"}, {"help", "h"}, {"independent", "i"}, {"iterations", "I"},
+    {"keep", "k"}, {"license", "L"}, {"list", "l"}, {"maxsplits", "M"},
+    {"name", "N"}, {"no-name", "n"}, {"no-time", "T"}, {"oneblock", "O"},
     {"processes", "p"}, {"quiet", "q"}, {"recursive", "r"}, {"rsyncable", "R"},
     {"silent", "q"}, {"stdout", "c"}, {"suffix", "S"}, {"test", "t"},
     {"to-stdout", "c"}, {"uncompress", "d"}, {"verbose", "v"},
@@ -3543,10 +3761,10 @@ local size_t num(char *arg)
     if (*str == 0)
         bail("internal error: empty parameter", "");
     do {
-        if (*str < '0' || *str > '9')
+        if (*str < '0' || *str > '9' ||
+            (val && ((~(size_t)0) - (*str - '0')) / val < 10))
             bail("invalid numeric parameter: ", arg);
         val = val * 10 + (*str - '0');
-        /* %% need to detect overflow here */
     } while (*++str);
     return val;
 }
@@ -3559,7 +3777,7 @@ local int option(char *arg)
 
     /* if no argument or dash option, check status of get */
     if (get && (arg == NULL || *arg == '-')) {
-        bad[1] = "bpS"[get - 1];
+        bad[1] = "bpSIM"[get - 1];
         bail("missing parameter after ", bad);
     }
     if (arg == NULL)
@@ -3595,18 +3813,23 @@ local int option(char *arg)
                 break;      /* allow -pnnn and -bnnn, fall to parameter code */
             }
 
-            /* process next single character option */
+            /* process next single character option or compression level */
             bad[1] = *arg;
             switch (*arg) {
             case '0': case '1': case '2': case '3': case '4':
             case '5': case '6': case '7': case '8': case '9':
                 g.level = *arg - '0';
-                while (arg[1] >= '0' && arg[1] <= '9')
+                while (arg[1] >= '0' && arg[1] <= '9') {
+                    if (g.level && (INT_MAX - (arg[1] - '0')) / g.level < 10)
+                        bail("only levels 0..9 and 11 are allowed", "");
                     g.level = g.level * 10 + *++arg - '0';
+                }
                 if (g.level == 10 || g.level > 11)
                     bail("only levels 0..9 and 11 are allowed", "");
                 new_opts();
                 break;
+            case 'F':  g.zopts.blocksplittinglast = 1;  break;
+            case 'I':  get = 4;  break;
             case 'K':  g.form = 2;  g.sufx = ".zip";  break;
             case 'L':
                 fputs(VERSION, stderr);
@@ -3617,10 +3840,12 @@ local int option(char *arg)
                       stderr);
                 fputs("No warranty is provided or implied.\n", stderr);
                 exit(0);
+            case 'M':  get = 5;  break;
             case 'N':  g.headis = 3;  break;
-            case 'T':  g.headis &= ~2;  break;
+            case 'O':  g.zopts.blocksplitting = 0;  break;
             case 'R':  g.rsync = 1;  break;
             case 'S':  get = 3;  break;
+            case 'T':  g.headis &= ~2;  break;
             case 'V':  fputs(VERSION, stderr);  exit(0);
             case 'Z':
                 bail("invalid option: LZW output not supported: ", bad);
@@ -3649,7 +3874,7 @@ local int option(char *arg)
             return 0;
     }
 
-    /* process option parameter for -b, -p, or -S */
+    /* process option parameter for -b, -p, -S, -I, or -M */
     if (get) {
         size_t n;
 
@@ -3680,6 +3905,10 @@ local int option(char *arg)
         }
         else if (get == 3)
             g.sufx = arg;                       /* gz suffix */
+        else if (get == 4)
+            g.zopts.numiterations = num(arg);   /* optimization iterations */
+        else if (get == 5)
+            g.zopts.blocksplittingmax = num(arg);   /* max block splits */
         get = 0;
         return 0;
     }

@@ -3,20 +3,20 @@ CFLAGS=-O3 -Wall -Wextra
 
 
 pigz: pigz.o yarn.o zopfli/deflate.o zopfli/blocksplitter.o zopfli/tree.o zopfli/lz77.o zopfli/cache.o zopfli/hash.o zopfli/util.o zopfli/squeeze.o zopfli/katajainen.o
-	$(CC) -o pigz $^ -lpthread -lz
+	$(CC) $(LDFLAGS) -o pigz $^ -lpthread -lz -lm
 	ln -f pigz unpigz
 
 pigz.o: pigz.c yarn.h zopfli/deflate.h zopfli/util.h
 
 yarn.o: yarn.c yarn.h
 
-zopfli/deflate.o: zopfli/deflate.c zopfli/deflate.h zopfli/blocksplitter.h zopfli/lz77.h zopfli/squeeze.h zopfli/tree.h zopfli/util.h
+zopfli/deflate.o: zopfli/deflate.c zopfli/deflate.h zopfli/blocksplitter.h zopfli/lz77.h zopfli/squeeze.h zopfli/tree.h zopfli/zopfli.h zopfli/cache.h zopfli/hash.h zopfli/util.h
 
-zopfli/blocksplitter.o: zopfli/blocksplitter.c zopfli/blocksplitter.h zopfli/deflate.h zopfli/lz77.h zopfli/squeeze.h zopfli/tree.h zopfli/util.h
+zopfli/blocksplitter.o: zopfli/blocksplitter.c zopfli/blocksplitter.h zopfli/deflate.h zopfli/lz77.h zopfli/squeeze.h zopfli/tree.h zopfli/util.h zopfli/zopfli.h zopfli/cache.h zopfli/hash.h
 
 zopfli/tree.o: zopfli/tree.c zopfli/tree.h zopfli/katajainen.h zopfli/util.h
 
-zopfli/lz77.o: zopfli/lz77.c zopfli/lz77.h zopfli/cache.h zopfli/hash.h zopfli/util.h
+zopfli/lz77.o: zopfli/lz77.h zopfli/util.h zopfli/cache.h zopfli/hash.h zopfli/zopfli.h
 
 zopfli/cache.o: zopfli/cache.c zopfli/cache.h zopfli/util.h
 
@@ -24,26 +24,26 @@ zopfli/hash.o: zopfli/hash.c zopfli/hash.h zopfli/util.h
 
 zopfli/util.o: zopfli/util.c zopfli/util.h
 
-zopfli/squeeze.o: zopfli/squeeze.c zopfli/squeeze.h zopfli/blocksplitter.h zopfli/deflate.h zopfli/tree.h zopfli/util.h zopfli/lz77.h
+zopfli/squeeze.o: zopfli/squeeze.c zopfli/squeeze.h zopfli/blocksplitter.h zopfli/deflate.h zopfli/tree.h zopfli/util.h zopfli/zopfli.h zopfli/lz77.h zopfli/cache.h zopfli/hash.h
 
 zopfli/katajainen.o: zopfli/katajainen.c zopfli/katajainen.h
 
 dev: pigz pigzt pigzn
 
-pigzt: pigzt.o yarnt.o
-	$(CC) -o pigzt pigzt.o yarnt.o -lpthread -lz
+pigzt: pigzt.o yarnt.o zopfli/deflate.o zopfli/blocksplitter.o zopfli/tree.o zopfli/lz77.o zopfli/cache.o zopfli/hash.o zopfli/util.o zopfli/squeeze.o zopfli/katajainen.o
+	$(CC) $(LDFLAGS) -o pigzt $^ -lpthread -lz -lm
 
 pigzt.o: pigz.c yarn.h
-	$(CC) -Wall -O3 -DDEBUG -g -c -o pigzt.o pigz.c
+	$(CC) $(CFLAGS) -DDEBUG -g -c -o pigzt.o pigz.c
 
 yarnt.o: yarn.c yarn.h
-	$(CC) -Wall -O3 -DDEBUG -g -c -o yarnt.o yarn.c
+	$(CC) $(CFLAGS) -DDEBUG -g -c -o yarnt.o yarn.c
 
-pigzn: pigzn.o
-	$(CC) -o pigzn pigzn.o -lz
+pigzn: pigzn.o zopfli/deflate.o zopfli/blocksplitter.o zopfli/tree.o zopfli/lz77.o zopfli/cache.o zopfli/hash.o zopfli/util.o zopfli/squeeze.o zopfli/katajainen.o
+	$(CC) $(LDFLAGS) -o pigzn $^ -lz -lm
 
 pigzn.o: pigz.c
-	$(CC) -Wall -O3 -DDEBUG -DNOTHREAD -g -c -o pigzn.o pigz.c
+	$(CC) $(CFLAGS) -DDEBUG -DNOTHREAD -g -c -o pigzn.o pigz.c
 
 test: pigz
 	./pigz -kf pigz.c ; ./pigz -t pigz.c.gz
