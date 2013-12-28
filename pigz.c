@@ -475,7 +475,9 @@ local struct {
     int first;              /* true if we need to print listing header */
     int decode;             /* 0 to compress, 1 to decompress, 2 to test */
     int level;              /* compression level */
+#ifndef WITHOUT_ZOPFLI
     ZopfliOptions zopts;    /* zopfli compression options */
+#endif
     int rsync;              /* true for rsync blocking */
     int procs;              /* maximum number of compression threads (>= 1) */
     int setdict;            /* true to initialize dictionary in each thread */
@@ -2119,6 +2121,7 @@ local void single_compress(int reset)
             else
                 DEFLATE_WRITE(Z_FINISH);
         }
+#ifndef WITHOUT_ZOPFLI
         else {
             /* compress got bytes using zopfli, bring to byte boundary */
             unsigned char bits, *out;
@@ -2167,6 +2170,7 @@ local void single_compress(int reset)
             strm->next_in += got;
             got = left;
         }
+#endif
 
         /* do until no more input */
     } while (more || got);
@@ -3707,7 +3711,9 @@ local void defaults(void)
         blocksplittinglast = 0
         blocksplittingmax = 15
      */
+#ifndef WITHOUT_ZOPFLI
     ZopfliInitOptions(&g.zopts);
+#endif
 #ifdef NOTHREAD
     g.procs = 1;
 #else
@@ -3828,7 +3834,11 @@ local int option(char *arg)
                     bail("only levels 0..9 and 11 are allowed", "");
                 new_opts();
                 break;
-            case 'F':  g.zopts.blocksplittinglast = 1;  break;
+            case 'F':
+#ifndef WITHOUT_ZOPFLI
+                g.zopts.blocksplittinglast = 1;
+#endif
+                break;
             case 'I':  get = 4;  break;
             case 'K':  g.form = 2;  g.sufx = ".zip";  break;
             case 'L':
@@ -3842,7 +3852,11 @@ local int option(char *arg)
                 exit(0);
             case 'M':  get = 5;  break;
             case 'N':  g.headis = 3;  break;
-            case 'O':  g.zopts.blocksplitting = 0;  break;
+            case 'O':
+#ifndef WITHOUT_ZOPFLI
+                g.zopts.blocksplitting = 0;
+#endif
+                break;
             case 'R':  g.rsync = 1;  break;
             case 'S':  get = 3;  break;
             case 'T':  g.headis &= ~2;  break;
@@ -3905,10 +3919,12 @@ local int option(char *arg)
         }
         else if (get == 3)
             g.sufx = arg;                       /* gz suffix */
+#ifndef WITHOUT_ZOPFLI
         else if (get == 4)
             g.zopts.numiterations = num(arg);   /* optimization iterations */
         else if (get == 5)
             g.zopts.blocksplittingmax = num(arg);   /* max block splits */
+#endif
         get = 0;
         return 0;
     }
