@@ -4,12 +4,16 @@ pigz_src_files := pigz.c yarn.c
 zopfli_src_files := zopfli/blocksplitter.c \
 					zopfli/cache.c \
 					zopfli/deflate.c \
-					zopfli/tree.c \
-					zopfli/lz77.c \
+					zopfli/gzip_container.c \
 					zopfli/hash.c \
-					zopfli/util.c \
+					zopfli/katajainen.c \
+					zopfli/lz77.c \
 					zopfli/squeeze.c \
-					zopfli/katajainen.c
+					zopfli/tree.c \
+					zopfli/util.c \
+					zopfli/zlib_container.c \
+					zopfli/zopfli_bin.c \
+					zopfli/zopfli_lib.c
 
 include $(CLEAR_VARS)
 LOCAL_MODULE := libzopfli
@@ -37,7 +41,7 @@ include $(CLEAR_VARS)
 LOCAL_MODULE := pigz
 LOCAL_MODULE_TAGS := optional
 LOCAL_SRC_FILES := main.c
-LOCAL_SHARED_LIBRARIES := libz libc
+LOCAL_SHARED_LIBRARIES := libz libc libm
 LOCAL_STATIC_LIBRARIES := libpigz libzopfli
 LOCAL_MODULE_PATH := $(TARGET_OUT_OPTIONAL_EXECUTABLES)
 include $(BUILD_EXECUTABLE)
